@@ -1,0 +1,290 @@
+# HXBot 测试包（公开打包仓库）：代码在私有仓库，每次运行用只读令牌现拉。由私有仓库的 hx/scripts/build-public.py 生成。
+name: HXBot public build
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "要打包的分支"
+        default: "v1.7.6"
+      platforms:
+        description: "平台（逗号分隔）：mac,windows,android"
+        default: "mac,windows,android"
+      vi_check:
+        description: "打好后查系统显示的 VI 图标（yes / no）"
+        default: "yes"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hxbot-public-build
+  cancel-in-progress: false
+
+jobs:
+  mac:
+    if: contains(inputs.platforms, 'mac')
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: mercywangqiang-tech/hx-bot-build-2026-11-15-v170
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.HX_SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with: { bun-version: 1.4.2 }
+      - uses: actions/setup-node@v6
+        with: { node-version: 24 }
+      - run: python3 hx/rebrand.py
+      - run: bun install --frozen-lockfile
+      - run: bun run dist:mac
+        env:
+          HXBOT_MAC_IDENTITY: ""
+          HXBOT_MAC_DEVELOPER_ID: "0"
+      - name: Check the signing identity
+        env:
+          HXBOT_MAC_CERT_SHA1: ""
+          HXBOT_MAC_TEAM_ID: ""
+          ALLOW_UNSIGNED: "yes"
+        run: bash hx/scripts/mac-signing-check.sh dist/mac-arm64/HXBot.app
+      - name: Verify in-app update files (version, names, size, sha512)
+        shell: bash
+        env:
+          PYTHONUTF8: "1"
+        run: |
+          ls -la dist
+          python3 hx/scripts/ci-verify-update-files.py mac
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hxbot-mac-arm64
+          path: |
+            dist/HXBot-*-arm64.dmg
+            dist/HXBot-*-arm64.dmg.blockmap
+            dist/HXBot-*-arm64.zip
+            dist/HXBot-*-arm64.zip.blockmap
+            dist/latest-mac.yml
+          if-no-files-found: error
+          retention-days: 1
+
+  windows:
+    if: contains(inputs.platforms, 'windows')
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: mercywangqiang-tech/hx-bot-build-2026-11-15-v170
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.HX_SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with: { bun-version: 1.4.2 }
+      - uses: actions/setup-node@v6
+        with: { node-version: 24 }
+      - run: python hx/rebrand.py
+        env:
+          PYTHONUTF8: "1"
+      - run: bun install --frozen-lockfile
+      - run: bun run dist:win
+        env:
+          GITHUB_TOKEN: ""
+          GH_TOKEN: ""
+      - name: Verify in-app update files (version, names, size, sha512)
+        shell: bash
+        env:
+          PYTHONUTF8: "1"
+        run: |
+          ls -la dist
+          python3 hx/scripts/ci-verify-update-files.py win
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hxbot-windows-x64
+          path: |
+            dist/HXBot-*-x64.exe
+            dist/HXBot-*-x64.exe.blockmap
+            dist/latest.yml
+          if-no-files-found: error
+          retention-days: 1
+
+  android:
+    if: contains(inputs.platforms, 'android')
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Disk before cleanup
+        run: df -h / /mnt || df -h /
+      - name: Free runner disk
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          android: false
+          tool-cache: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+      - name: Disk after cleanup
+        run: |
+          sudo rm -rf /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h / /mnt || df -h /
+          ls /usr/local/lib/android/sdk/ndk || true
+      - uses: actions/checkout@v6
+        with:
+          repository: mercywangqiang-tech/hx-bot-build-2026-11-15-v170
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.HX_SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with: { bun-version: 1.4.2 }
+      - uses: actions/setup-node@v6
+        with: { node-version: 24 }
+      - uses: actions/setup-java@v5
+        with: { distribution: temurin, java-version: "17" }
+      - name: Give Gradle more memory
+        run: |
+          mkdir -p ~/.gradle
+          echo 'org.gradle.jvmargs=-Xmx6g -XX:MaxMetaspaceSize=2g -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8' >> ~/.gradle/gradle.properties
+          echo 'org.gradle.workers.max=2' >> ~/.gradle/gradle.properties
+          SWAP=/mnt/swapfile-build; [ -d /mnt ] && [ -w /mnt ] || SWAP=/swapfile-build
+          sudo fallocate -l 8G "$SWAP" && sudo chmod 600 "$SWAP" && sudo mkswap "$SWAP" && sudo swapon "$SWAP" || echo "::warning::swap 未启用"
+          free -h; df -h / /mnt || df -h /
+      - run: bash hx/scripts/build-android.sh
+      - name: Disk after build
+        if: always()
+        run: df -h / /mnt || df -h /
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hxbot-android
+          path: dist-hx/HXBot-*-android.apk
+          if-no-files-found: error
+          retention-days: 1
+
+  vi-check-mac:
+    if: inputs.vi_check == 'yes' && needs.mac.result == 'success'
+    needs: [mac]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: mercywangqiang-tech/hx-bot-build-2026-11-15-v170
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.HX_SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.12" }
+      - name: Install Pillow, numpy and PyObjC
+        run: python -m pip install pillow numpy pyobjc-framework-Cocoa
+      - uses: actions/download-artifact@v8
+        with:
+          name: hxbot-mac-arm64
+          path: new
+      - name: Check
+        shell: bash
+        run: python hx/scripts/vi-device-check.py --package "$(ls new/HXBot-*-arm64.zip | head -1)" --out out
+      - name: Show the summary
+        if: always()
+        shell: bash
+        run: python hx/scripts/vi-device-check.py --summary --out out >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: hxbot-vi-check-${{ matrix.os }}
+          path: out
+          if-no-files-found: warn
+          retention-days: 7
+
+  vi-check-windows:
+    if: inputs.vi_check == 'yes' && needs.windows.result == 'success'
+    needs: [windows]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: mercywangqiang-tech/hx-bot-build-2026-11-15-v170
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.HX_SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.12" }
+      - name: Install Pillow and numpy
+        run: python -m pip install pillow numpy
+      - uses: actions/download-artifact@v8
+        with:
+          name: hxbot-windows-x64
+          path: new
+      - name: Check
+        shell: bash
+        run: python hx/scripts/vi-device-check.py --package "$(ls new/HXBot-*-x64.exe | head -1)" --out out
+      - name: Show the summary
+        if: always()
+        shell: bash
+        run: python hx/scripts/vi-device-check.py --summary --out out >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: hxbot-vi-check-${{ matrix.os }}
+          path: out
+          if-no-files-found: warn
+          retention-days: 7
+
+  vi-check-android:
+    if: inputs.vi_check == 'yes' && needs.android.result == 'success'
+    needs: [android]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: mercywangqiang-tech/hx-bot-build-2026-11-15-v170
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.HX_SOURCE_TOKEN }}
+          persist-credentials: false
+      - name: Let the emulator use KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.12" }
+      - name: Install Pillow, numpy and ffmpeg
+        run: |
+          python -m pip install pillow numpy
+          command -v ffmpeg || (sudo apt-get update && sudo apt-get install -y ffmpeg)
+      - uses: actions/download-artifact@v8
+        with:
+          name: hxbot-android
+          path: new
+      - name: Check on the emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          disable-animations: false
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          script: python hx/scripts/vi-android-check.py --apk "$(ls new/HXBot-*-android.apk | head -1)" --out out
+      - name: Show the summary
+        if: always()
+        shell: bash
+        run: python hx/scripts/vi-android-check.py --summary --out out >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: hxbot-vi-check-android
+          path: out
+          if-no-files-found: warn
+          retention-days: 7
+
