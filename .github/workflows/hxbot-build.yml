@@ -13,6 +13,9 @@ on:
       vi_check:
         description: "打好后查系统显示的 VI 图标（yes / no）"
         default: "yes"
+      icon_catalog:
+        description: "在 macos-26 上编译 macOS 26 图标目录并画出系统显示的图标（yes / no；只做这个时平台填 none）"
+        default: "no"
 
 permissions:
   contents: read
@@ -284,6 +287,43 @@ jobs:
         if: always()
         with:
           name: hxbot-vi-check-android
+          path: out
+          if-no-files-found: warn
+          retention-days: 7
+
+  mac-icon-catalog:
+    if: inputs.icon_catalog == 'yes'
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: mercywangqiang-tech/hx-bot-build-2026-11-15-v170
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.HX_SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.12" }
+      - name: Install Pillow, numpy and PyObjC
+        run: python -m pip install pillow numpy pyobjc-framework-Cocoa
+      - name: Use Xcode 26
+        shell: bash
+        run: |
+          ls -d /Applications/Xcode*.app || true
+          newest=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$newest" ]; then sudo xcode-select -s "$newest"; fi
+          xcodebuild -version
+      - name: Compile and draw
+        shell: bash
+        run: python hx/scripts/mac-icon-catalog.py --out out
+      - name: Show the report
+        if: always()
+        shell: bash
+        run: cat out/report.md >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: hxbot-icon-catalog
           path: out
           if-no-files-found: warn
           retention-days: 7
