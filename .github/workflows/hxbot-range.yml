@@ -93,6 +93,7 @@ jobs:
               (re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"), "<uuid>"),
               (re.compile(r"(127\.0\.0\.1|localhost):\d{2,5}"), r"\1:<port>"),
               (re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z"), "<time>"),
+              (re.compile(r"\d{4}-\d\d-\d\dT\d\d-\d\d-\d\d(?:-\d+)?Z"), "<time>"),
               (re.compile(r'(\\*"(?:waitedMs|elapsedMs|durationMs|ms)\\*"\s*:\s*)\d+(?:\.\d+)?'), r"\1<n>"),
           )
           EMAIL = re.compile(rb"[A-Za-z0-9._%+-]+@((?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,})")
@@ -115,7 +116,9 @@ jobs:
               "label": LABEL_RULE,
               "nonce": r"[A-Za-z0-9-]{0,40}",
           }
-          REQUEST_FILES = {".github/workflows/hx-range-selfhosted.yml", "hx/range-request.json"}
+          REQUEST_FILES = {".github/workflows/hx-range-selfhosted.yml", "hx/range-request.json", ".hx-run.json"}
+          LLM_BASE = "https://api.moonshot.cn/v1"
+          LLM_PREFERRED = ("kimi-k3", "kimi-k2.6")
           UNHINTED = """<?xml version="1.0"?>
           <!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
           <fontconfig>
@@ -213,7 +216,7 @@ jobs:
               return ordered[min(len(ordered) - 1, math.floor((p / 100) * len(ordered)))]
 
 
-          def summarize(results: list) -> dict:
+          def summarize(results: list, toolset: str = "", model: str = "") -> dict:
               ran = len(results)
               ok = sum(1 for item in results if item.get("ok"))
               calls = [item.get("calls", 0) for item in results]
@@ -232,8 +235,37 @@ jobs:
                   "stepMs": {"median": percentile(step_ms, 50), "p95": percentile(step_ms, 95)},
               }
               if any(item.get("llm") for item in results):
-                  summary["llm"] = "not merged"
+                  summary["llm"] = llm_summary(results, toolset, model)
               return summary
+
+
+          def js_round(value: float) -> int:
+              return math.floor(value + 0.5)
+
+
+          def llm_summary(results: list, toolset: str, model: str) -> dict:
+              usages = [item["llm"] for item in results if item.get("llm")]
+
+              def total(name: str):
+                  return sum(usage.get(name, 0) for usage in usages)
+              return {
+                  "toolset": toolset,
+                  "model": model,
+                  "promptTokens": total("promptTokens"),
+                  "outputTokens": total("outputTokens"),
+                  "sentChars": total("sentChars"),
+                  "turns": {"total": total("turns"), "median": percentile([usage.get("turns", 0) for usage in usages], 50)},
+                  "toolCalls": {"total": total("toolCalls"),
+                                "median": percentile([usage.get("toolCalls", 0) for usage in usages], 50)},
+                  "modelMs": {"total": js_round(total("modelMs")),
+                              "median": js_round(percentile([usage.get("modelMs", 0) for usage in usages], 50))},
+                  "stopped": {kind: sum(1 for usage in usages if usage.get("stopped") == kind)
+                              for kind in ("turns", "budget", "error")},
+                  "honestFailures": sum(1 for item in results if not item.get("ok") and item.get("failed")
+                                        and not (item.get("llm") or {}).get("stopped")),
+                  "refused": total("refused"),
+                  "badCalls": total("badCalls"),
+              }
 
 
           def merge(parts: list, count: int, only: str = "") -> dict:
@@ -285,7 +317,7 @@ jobs:
                   merged["reason"] = "; ".join(problems)
               merged.update({
                   "pages": sum(int(report.get("pages") or 0) for _, report in present),
-                  "summary": summarize(results),
+                  "summary": summarize(results, *shard_llm(real)),
                   "hangs": [item for _, report in present for item in report.get("hangs") or []],
                   "mainFailures": [item for _, report in present for item in report.get("mainFailures") or []],
                   "visionOnly": next((report["visionOnly"] for _, report in real if "visionOnly" in report), []),
@@ -295,6 +327,14 @@ jobs:
                              for index, report in present],
               })
               return merged
+
+
+          def shard_llm(real: list) -> tuple:
+              for _, report in real:
+                  llm = (report.get("summary") or {}).get("llm")
+                  if isinstance(llm, dict):
+                      return str(llm.get("toolset", "")), str(llm.get("model", ""))
+              return "", ""
 
 
           def group_table(results: list) -> dict:
@@ -326,7 +366,7 @@ jobs:
               results = merged.get("results") or []
               summary = merged.get("summary") or {}
               head = {key: summary.get(key) for key in ("tasks", "ok", "accuracy", "falseSuccess", "falseFailure",
-                                                         "roundTrips", "chars", "taskMs", "stepMs")}
+                                                         "roundTrips", "chars", "taskMs", "stepMs", "llm") if key in summary}
               head.update({"run": run, "status": merged.get("status"), "problems": merged.get("reason", ""),
                            "sourceSha": merged.get("sourceSha"), "buildId": merged.get("buildId", ""),
                            "runId": merged.get("runId"), "mode": merged.get("mode"), "faultMode": merged.get("faultMode"),
@@ -344,7 +384,9 @@ jobs:
                   lines.append(emit("GROUP", {"run": run, "groups": dict(part)}))
               if len(results) <= TASK_LINES_MAX:
                   rows = [[task_key(item), bool(item.get("ok")), bool(item.get("falseSuccess")),
-                           bool(item.get("falseFailure")), item.get("steps"), item.get("calls"), task_fp(item)]
+                           bool(item.get("falseFailure")), item.get("steps"), item.get("calls"), task_fp(item), item.get("ms"),
+                           [item["llm"].get(name) for name in ("promptTokens", "outputTokens", "turns", "modelMs", "stopped")]
+                           if item.get("llm") else None]
                           for item in results]
                   for part in chunks(rows, 25):
                       lines.append(emit("TASK", {"run": run, "tasks": part}))
@@ -353,7 +395,8 @@ jobs:
 
           def parse_lines(text: str) -> dict:
               found: dict = {"SUMMARY": [], "FAIL": [], "FAILCOUNT": [], "GROUP": [], "TASK": [], "SHARD": [], "ENV": [],
-                             "SCAN": [], "DETERMINISM": [], "DONE": [], "B64BEGIN": [], "B64": [], "B64END": []}
+                             "SCAN": [], "DETERMINISM": [], "DONE": [], "B64BEGIN": [], "B64": [], "B64END": [], "MODEL": [],
+                             "JOB": [], "JOBS": [], "BUILD": []}
               marker = PREFIX + "-"
               for line in text.splitlines():
                   start = line.find(marker)
@@ -382,7 +425,7 @@ jobs:
                       "badComplete": count.get("count", 0) == count.get("printed", 0), "groups": groups, "tasks": tasks}
 
 
-          def scan_bytes(data: bytes, rules: list, secret: str = "") -> list:
+          def scan_bytes(data: bytes, rules: list, secret: str = "", emails: bool = True) -> list:
               found = set()
               by_length: dict = {}
               for length, digest, category in rules:
@@ -397,7 +440,7 @@ jobs:
                           left.discard(category)
                           if not left:
                               break
-              for match in EMAIL.finditer(data):
+              for match in EMAIL.finditer(data) if emails else ():
                   if not EMAIL_OK.search(match.group(1)):
                       found.add("email")
                       break
@@ -506,8 +549,43 @@ jobs:
               say(emit("SHARD", {"shard": shard, "run": run, "status": report.get("status"), "seconds": seconds,
                                  "tasks": summary["tasks"], "ok": summary["ok"], "falseSuccess": summary["falseSuccess"],
                                  "falseFailure": summary["falseFailure"], "pages": len(pages), "expected": len(expected),
-                                 "selection": "same" if match else "different"}))
+                                 "selection": "same" if match else "different",
+                                 **({"promptTokens": summary["llm"]["promptTokens"], "outputTokens": summary["llm"]["outputTokens"]}
+                                    if isinstance(summary.get("llm"), dict) else {})}))
               return report.get("status") == "passed" and match, report
+
+
+          def choose_model(base: str, key: str) -> tuple:
+              import urllib.request
+              request = urllib.request.Request(base.rstrip("/") + "/models", headers={"Authorization": f"Bearer {key}"})
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  ids = sorted(str(item.get("id")) for item in json.loads(response.read()).get("data", []))
+              for wanted in LLM_PREFERRED:
+                  if wanted in ids:
+                      return wanted, ids
+              for wanted in LLM_PREFERRED:
+                  close = [item for item in ids if item.startswith(wanted)]
+                  if close:
+                      return close[0], ids
+              return None, ids
+
+
+          def llm_env(settings: dict) -> dict | None:
+              key = os.environ.get("HXR_LLM_KEY", "").strip()
+              if not key:
+                  say(emit("MODEL", {"error": "no key"}))
+                  return None
+              try:
+                  model, ids = choose_model(LLM_BASE, key)
+              except (OSError, ValueError) as error:
+                  say(emit("MODEL", {"error": type(error).__name__}))
+                  return None
+              if model is None:
+                  say(emit("MODEL", {"error": "no preferred model", "kimi": [item for item in ids if item.startswith("kimi")]}))
+                  return None
+              say(emit("MODEL", {"model": model}))
+              return {"HX_LLM_API": "openai", "HX_LLM_BASE": LLM_BASE, "HX_LLM_KEY": key, "HX_LLM_MODEL": model,
+                      "HX_LLM_BUDGET": str(settings["llmBudget"]), "HX_LLM_MAX_TURNS": str(settings["llmMaxTurns"] or 30)}
 
 
           def run_shards(root: str, out: str, shards: list, settings: dict) -> bool:
@@ -531,6 +609,11 @@ jobs:
                                           text=True).stdout.strip()
               passes = int(settings.get("passes", 1))
               guard = max(10, int(settings.get("budget", 50)) // passes)
+              model_env: dict = {}
+              if settings.get("policy") == "llm":
+                  model_env = llm_env(settings) or {}
+                  if not model_env:
+                      return False
 
               def one(shard: int) -> bool:
                   folder = out_path / str(shard)
@@ -556,8 +639,10 @@ jobs:
                       if not expected:
                           target.write_text(json.dumps(empty_report(str(uuid.uuid4()), source_sha)), encoding="utf-8")
                       else:
-                          env = dict(os.environ, HX_RANGE_GUARD_MINUTES=str(guard), LANG="C.UTF-8", LC_ALL="C.UTF-8")
+                          env = dict(os.environ, HX_RANGE_GUARD_MINUTES=str(guard), LANG="C.UTF-8", LC_ALL="C.UTF-8",
+                                     **model_env)
                           env.pop("HX_RANGE_VISION", None)
+                          env.pop("HXR_LLM_KEY", None)
                           command = ["xvfb-run", "-a", "-n", str(100 + shard * 7), "bun", "scripts/hx-range-e2e.ts", *args,
                                      f"--label={label}"]
                           with open(folder / f"range-r{run}.log", "wb") as log:
@@ -699,7 +784,8 @@ jobs:
                       "repeat": int(values.get("repeat", 1)), "faults": str(values.get("faults", "")),
                       "policy": str(values.get("policy", "v176")), "old": str(values.get("old", "")),
                       "shards": int(values.get("shards", 1)), "passes": int(values.get("passes", 1)),
-                      "label": str(values.get("label", "")), "prefix": prefix, "budget": budget}
+                      "label": str(values.get("label", "")), "prefix": prefix, "budget": budget,
+                      "llmBudget": int(values.get("llmBudget") or 0), "llmMaxTurns": int(values.get("llmMaxTurns") or 0)}
 
 
           def read_request(path: str) -> dict:
@@ -707,7 +793,15 @@ jobs:
               values = {key: request.get(key, default) for key, default in (
                   ("only", ""), ("repeat", 1), ("faults", ""), ("policy", "v176"), ("old", ""), ("shards", 16),
                   ("passes", 1), ("label", ""), ("nonce", ""))}
-              bad = check_inputs(values)
+              llm = values["policy"] == "llm"
+              bad = check_inputs({**values, "policy": "v176"} if llm else values)
+              if llm:
+                  budget, turns = request.get("llmBudget"), request.get("llmMaxTurns", 30)
+                  if not isinstance(budget, int) or isinstance(budget, bool) or not 1 <= budget <= 5_000_000:
+                      bad.append("llmBudget")
+                  if not isinstance(turns, int) or isinstance(turns, bool) or not 1 <= turns <= 60:
+                      bad.append("llmMaxTurns")
+                  values["llmBudget"], values["llmMaxTurns"] = budget, turns
               pages = request.get("pages") or []
               if not isinstance(pages, list) or len(pages) > 5000 or any(
                       not isinstance(item, str) or not re.fullmatch(r"[A-Za-z0-9/_.-]{1,200}", item) or ".." in item
@@ -734,6 +828,112 @@ jobs:
               git("checkout", "-q", "--detach", base)
 
 
+          JOB_NAME = r"[A-Za-z0-9._-]{1,60}"
+
+
+          def read_jobs(path: str) -> dict:
+              spec = json.loads(Path(path).read_text(encoding="utf-8"))
+              bad = []
+              if not re.fullmatch(LABEL_RULE, str(spec.get("label", ""))):
+                  bad.append("label")
+              jobs = spec.get("jobs")
+              if not isinstance(jobs, list) or not 1 <= len(jobs) <= 64:
+                  bad.append("jobs")
+                  jobs = []
+              names = set()
+              for job in jobs:
+                  name, cmd = (job.get("name"), job.get("cmd")) if isinstance(job, dict) else (None, None)
+                  if not isinstance(name, str) or not re.fullmatch(JOB_NAME, name) or name in names:
+                      bad.append("job name")
+                  if not isinstance(cmd, str) or not cmd.strip() or len(cmd) > 4000 or "\n" in cmd:
+                      bad.append("job cmd")
+                  names.add(name)
+              parallel = spec.get("parallel", 8)
+              if not isinstance(parallel, int) or isinstance(parallel, bool) or not 1 <= parallel <= 32:
+                  bad.append("parallel")
+              llm = spec.get("llm")
+              if llm is not None:
+                  budget, turns = (llm.get("budget"), llm.get("maxTurns", 30)) if isinstance(llm, dict) else (None, None)
+                  if not isinstance(budget, int) or isinstance(budget, bool) or not 1 <= budget <= 5_000_000:
+                      bad.append("llm budget")
+                  if not isinstance(turns, int) or isinstance(turns, bool) or not 1 <= turns <= 60:
+                      bad.append("llm maxTurns")
+              if bad:
+                  raise SystemExit("bad .hx-run.json fields: " + ", ".join(sorted(set(bad))))
+              return {"label": spec["label"], "jobs": jobs, "parallel": parallel, "build": bool(spec.get("build")),
+                      "llm": llm, "base": str(spec.get("base", ""))}
+
+
+          def report_of(cmd: str) -> str:
+              mode = re.search(r"--mode=([A-Za-z0-9_-]+)", cmd)
+              label = re.search(r"--label=([A-Za-z0-9_.-]+)", cmd)
+              name = f"hx-range-{mode.group(1) if mode else 'health'}" + (f"-{label.group(1)}" if label else "")
+              return f".hxbot-build/{name}/report.json"
+
+
+          def run_jobs(root: str, spec_path: str, logs: str) -> bool:
+              spec = read_jobs(spec_path)
+              root_path, logs_path = Path(root), Path(logs)
+              logs_path.mkdir(parents=True, exist_ok=True)
+              model_env: dict = {}
+              if spec["llm"]:
+                  model_env = llm_env({"llmBudget": spec["llm"]["budget"], "llmMaxTurns": spec["llm"].get("maxTurns", 30)}) or {}
+                  if not model_env:
+                      return False
+              if spec["build"]:
+                  started = time.monotonic()
+                  with open(logs_path / "build.log", "wb") as log:
+                      done = subprocess.run(["bun", "run", "build"], cwd=root_path, stdout=log, stderr=subprocess.STDOUT)
+                  say(emit("BUILD", {"exit": done.returncode, "seconds": round(time.monotonic() - started)}))
+                  if done.returncode != 0:
+                      return False
+              reports: dict = {}
+
+              def one(item: tuple) -> bool:
+                  index, job = item
+                  time.sleep(min(index, 16) * 2)
+                  cmd = re.sub(r"(^|\s)xvfb-run -a(\s)", rf"\1xvfb-run -a -n {200 + index * 5}\2", job["cmd"], count=1)
+                  env = dict(os.environ, LANG="C.UTF-8", LC_ALL="C.UTF-8", **model_env)
+                  env.pop("HXR_LLM_KEY", None)
+                  relative = report_of(job["cmd"])
+                  target = root_path / relative
+                  started = time.time()
+                  with open(logs_path / f"{job['name']}.log", "wb") as log:
+                      done = subprocess.run(["bash", "-c", cmd], cwd=root_path, env=env, stdout=log, stderr=subprocess.STDOUT)
+                  seconds = round(time.time() - started)
+                  report = read_report(target) if target.exists() and target.stat().st_mtime >= started - 1 else None
+                  line = {"name": job["name"], "exit": done.returncode, "seconds": seconds, "report": relative if report else ""}
+                  if report is not None:
+                      summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
+                      line.update({"status": report.get("status"), **{key: summary.get(key) for key in
+                                   ("tasks", "ok", "falseSuccess", "falseFailure") if key in summary}})
+                      if isinstance(summary.get("llm"), dict):
+                          line.update({"model": summary["llm"].get("model"), "promptTokens": summary["llm"].get("promptTokens"),
+                                       "outputTokens": summary["llm"].get("outputTokens")})
+                      reports[relative] = target
+                  say(emit("JOB", line))
+                  if done.returncode != 0 and not model_env:
+                      tail = (logs_path / f"{job['name']}.log").read_text(encoding="utf-8", errors="replace").splitlines()[-30:]
+                      for text in tail:
+                          say(f"  {job['name']}| {text[:300]}")
+                  return done.returncode == 0
+
+              with ThreadPoolExecutor(max_workers=spec["parallel"]) as pool:
+                  outcomes = list(pool.map(one, list(enumerate(spec["jobs"]))))
+              secret = os.environ.get("HXR_SECRET", "")
+              for relative, path in sorted(reports.items()):
+                  found = scan_bytes(path.read_bytes(), [], secret, emails=False)
+                  if found:
+                      say(emit("SCAN", {"clean": False, "hits": {relative: found}}))
+                      outcomes.append(False)
+                      continue
+                  for line in b64_lines(str(path), relative):
+                      say(line)
+              say(emit("DONE", {"jobs": len(spec["jobs"]), "passed": sum(1 for item in outcomes[:len(spec["jobs"])] if item),
+                                "reports": len(reports), "ok": all(outcomes)}))
+              return all(outcomes)
+
+
           def runner_main(argv: list) -> int:
               command, args = (argv[0], argv[1:]) if argv else ("", [])
               if command == "fonts":
@@ -754,6 +954,13 @@ jobs:
                   settings = settings_from(values, args[1] if len(args) > 1 else "gh", int(args[2]) if len(args) > 2 else 50)
                   Path(args[0]).write_text(json.dumps(settings), encoding="utf-8")
                   return 0
+              if command == "jobs-check":
+                  spec = read_jobs(args[0])
+                  say(emit("JOBS", {"label": spec["label"], "jobs": len(spec["jobs"]), "parallel": spec["parallel"],
+                                    "build": spec["build"], "llm": bool(spec["llm"]), "base": spec["base"]}))
+                  return 0
+              if command == "jobs":
+                  return 0 if run_jobs(args[0], args[1], args[2]) else 1
               if command == "request":
                   values = read_request(args[0])
                   check_request_commit(args[1], values["base"])
@@ -766,11 +973,12 @@ jobs:
                   return 0 if run_shards(args[0], args[1], shards, settings) else 1
               if command == "scan":
                   secret = os.environ.get("HXR_SECRET", "")
+                  private = bool(args) and args[0] == "--private"
                   hits = {}
-                  for name in args:
+                  for name in args[1:] if private else args:
                       path = Path(name)
                       if path.is_file():
-                          found = scan_bytes(path.read_bytes(), SCAN_RULES, secret)
+                          found = scan_bytes(path.read_bytes(), [] if private else SCAN_RULES, secret, emails=not private)
                           if found:
                               hits[path.name] = found
                   say(emit("SCAN", {"clean": not hits, "hits": hits}))
@@ -808,9 +1016,20 @@ jobs:
       - uses: actions/setup-node@v6
         with: { node-version: 24 }
       - name: Install the display and the fonts
+        timeout-minutes: 25
         run: |
-          sudo apt-get update -qq > "$RUNNER_TEMP/apt.log" 2>&1
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends xvfb fonts-crosextra-caladea fonts-crosextra-carlito fonts-dejavu fonts-dejavu-extra fonts-freefont-ttf fonts-gfs-baskerville fonts-gfs-porson fonts-inter fonts-ipafont-gothic fonts-liberation fonts-liberation2 fonts-lmodern fonts-noto-cjk fonts-noto-cjk-extra fonts-noto-color-emoji fonts-opensymbol fonts-texgyre fonts-tlwg-loma-otf fonts-unifont fonts-wqy-zenhei >> "$RUNNER_TEMP/apt.log" 2>&1 || { echo "apt-get: failed"; exit 1; }
+          sudo rm -f /var/lib/man-db/auto-update
+          apt="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Dpkg::Lock::Timeout=300"
+          for attempt in 1 2; do
+            start=$SECONDS
+            if timeout 600 sudo apt-get $apt update -qq > "$RUNNER_TEMP/apt.log" 2>&1 && timeout 900 sudo DEBIAN_FRONTEND=noninteractive apt-get $apt install -y -qq --no-install-recommends xvfb fonts-crosextra-caladea fonts-crosextra-carlito fonts-dejavu fonts-dejavu-extra fonts-freefont-ttf fonts-gfs-baskerville fonts-gfs-porson fonts-inter fonts-ipafont-gothic fonts-liberation fonts-liberation2 fonts-lmodern fonts-noto-cjk fonts-noto-cjk-extra fonts-noto-color-emoji fonts-opensymbol fonts-texgyre fonts-tlwg-loma-otf fonts-unifont fonts-wqy-zenhei >> "$RUNNER_TEMP/apt.log" 2>&1; then
+              echo "apt-get: $((SECONDS - start)) s"
+              break
+            fi
+            echo "apt-get: attempt $attempt failed after $((SECONDS - start)) s"
+            tail -n 3 "$RUNNER_TEMP/apt.log" | cut -c1-200
+            if [ "$attempt" = 2 ]; then exit 1; fi
+          done
           fc-cache -f > /dev/null 2>&1
           python3 "$RUNNER_TEMP/hxr.py" fonts "$RUNNER_TEMP/fonts" "$GITHUB_ENV"
           FONTCONFIG_FILE="$RUNNER_TEMP/fonts/fonts.conf" python3 "$RUNNER_TEMP/hxr.py" env "${{ matrix.shard }}"
@@ -901,6 +1120,7 @@ jobs:
               (re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"), "<uuid>"),
               (re.compile(r"(127\.0\.0\.1|localhost):\d{2,5}"), r"\1:<port>"),
               (re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z"), "<time>"),
+              (re.compile(r"\d{4}-\d\d-\d\dT\d\d-\d\d-\d\d(?:-\d+)?Z"), "<time>"),
               (re.compile(r'(\\*"(?:waitedMs|elapsedMs|durationMs|ms)\\*"\s*:\s*)\d+(?:\.\d+)?'), r"\1<n>"),
           )
           EMAIL = re.compile(rb"[A-Za-z0-9._%+-]+@((?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,})")
@@ -923,7 +1143,9 @@ jobs:
               "label": LABEL_RULE,
               "nonce": r"[A-Za-z0-9-]{0,40}",
           }
-          REQUEST_FILES = {".github/workflows/hx-range-selfhosted.yml", "hx/range-request.json"}
+          REQUEST_FILES = {".github/workflows/hx-range-selfhosted.yml", "hx/range-request.json", ".hx-run.json"}
+          LLM_BASE = "https://api.moonshot.cn/v1"
+          LLM_PREFERRED = ("kimi-k3", "kimi-k2.6")
           UNHINTED = """<?xml version="1.0"?>
           <!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
           <fontconfig>
@@ -1021,7 +1243,7 @@ jobs:
               return ordered[min(len(ordered) - 1, math.floor((p / 100) * len(ordered)))]
 
 
-          def summarize(results: list) -> dict:
+          def summarize(results: list, toolset: str = "", model: str = "") -> dict:
               ran = len(results)
               ok = sum(1 for item in results if item.get("ok"))
               calls = [item.get("calls", 0) for item in results]
@@ -1040,8 +1262,37 @@ jobs:
                   "stepMs": {"median": percentile(step_ms, 50), "p95": percentile(step_ms, 95)},
               }
               if any(item.get("llm") for item in results):
-                  summary["llm"] = "not merged"
+                  summary["llm"] = llm_summary(results, toolset, model)
               return summary
+
+
+          def js_round(value: float) -> int:
+              return math.floor(value + 0.5)
+
+
+          def llm_summary(results: list, toolset: str, model: str) -> dict:
+              usages = [item["llm"] for item in results if item.get("llm")]
+
+              def total(name: str):
+                  return sum(usage.get(name, 0) for usage in usages)
+              return {
+                  "toolset": toolset,
+                  "model": model,
+                  "promptTokens": total("promptTokens"),
+                  "outputTokens": total("outputTokens"),
+                  "sentChars": total("sentChars"),
+                  "turns": {"total": total("turns"), "median": percentile([usage.get("turns", 0) for usage in usages], 50)},
+                  "toolCalls": {"total": total("toolCalls"),
+                                "median": percentile([usage.get("toolCalls", 0) for usage in usages], 50)},
+                  "modelMs": {"total": js_round(total("modelMs")),
+                              "median": js_round(percentile([usage.get("modelMs", 0) for usage in usages], 50))},
+                  "stopped": {kind: sum(1 for usage in usages if usage.get("stopped") == kind)
+                              for kind in ("turns", "budget", "error")},
+                  "honestFailures": sum(1 for item in results if not item.get("ok") and item.get("failed")
+                                        and not (item.get("llm") or {}).get("stopped")),
+                  "refused": total("refused"),
+                  "badCalls": total("badCalls"),
+              }
 
 
           def merge(parts: list, count: int, only: str = "") -> dict:
@@ -1093,7 +1344,7 @@ jobs:
                   merged["reason"] = "; ".join(problems)
               merged.update({
                   "pages": sum(int(report.get("pages") or 0) for _, report in present),
-                  "summary": summarize(results),
+                  "summary": summarize(results, *shard_llm(real)),
                   "hangs": [item for _, report in present for item in report.get("hangs") or []],
                   "mainFailures": [item for _, report in present for item in report.get("mainFailures") or []],
                   "visionOnly": next((report["visionOnly"] for _, report in real if "visionOnly" in report), []),
@@ -1103,6 +1354,14 @@ jobs:
                              for index, report in present],
               })
               return merged
+
+
+          def shard_llm(real: list) -> tuple:
+              for _, report in real:
+                  llm = (report.get("summary") or {}).get("llm")
+                  if isinstance(llm, dict):
+                      return str(llm.get("toolset", "")), str(llm.get("model", ""))
+              return "", ""
 
 
           def group_table(results: list) -> dict:
@@ -1134,7 +1393,7 @@ jobs:
               results = merged.get("results") or []
               summary = merged.get("summary") or {}
               head = {key: summary.get(key) for key in ("tasks", "ok", "accuracy", "falseSuccess", "falseFailure",
-                                                         "roundTrips", "chars", "taskMs", "stepMs")}
+                                                         "roundTrips", "chars", "taskMs", "stepMs", "llm") if key in summary}
               head.update({"run": run, "status": merged.get("status"), "problems": merged.get("reason", ""),
                            "sourceSha": merged.get("sourceSha"), "buildId": merged.get("buildId", ""),
                            "runId": merged.get("runId"), "mode": merged.get("mode"), "faultMode": merged.get("faultMode"),
@@ -1152,7 +1411,9 @@ jobs:
                   lines.append(emit("GROUP", {"run": run, "groups": dict(part)}))
               if len(results) <= TASK_LINES_MAX:
                   rows = [[task_key(item), bool(item.get("ok")), bool(item.get("falseSuccess")),
-                           bool(item.get("falseFailure")), item.get("steps"), item.get("calls"), task_fp(item)]
+                           bool(item.get("falseFailure")), item.get("steps"), item.get("calls"), task_fp(item), item.get("ms"),
+                           [item["llm"].get(name) for name in ("promptTokens", "outputTokens", "turns", "modelMs", "stopped")]
+                           if item.get("llm") else None]
                           for item in results]
                   for part in chunks(rows, 25):
                       lines.append(emit("TASK", {"run": run, "tasks": part}))
@@ -1161,7 +1422,8 @@ jobs:
 
           def parse_lines(text: str) -> dict:
               found: dict = {"SUMMARY": [], "FAIL": [], "FAILCOUNT": [], "GROUP": [], "TASK": [], "SHARD": [], "ENV": [],
-                             "SCAN": [], "DETERMINISM": [], "DONE": [], "B64BEGIN": [], "B64": [], "B64END": []}
+                             "SCAN": [], "DETERMINISM": [], "DONE": [], "B64BEGIN": [], "B64": [], "B64END": [], "MODEL": [],
+                             "JOB": [], "JOBS": [], "BUILD": []}
               marker = PREFIX + "-"
               for line in text.splitlines():
                   start = line.find(marker)
@@ -1190,7 +1452,7 @@ jobs:
                       "badComplete": count.get("count", 0) == count.get("printed", 0), "groups": groups, "tasks": tasks}
 
 
-          def scan_bytes(data: bytes, rules: list, secret: str = "") -> list:
+          def scan_bytes(data: bytes, rules: list, secret: str = "", emails: bool = True) -> list:
               found = set()
               by_length: dict = {}
               for length, digest, category in rules:
@@ -1205,7 +1467,7 @@ jobs:
                           left.discard(category)
                           if not left:
                               break
-              for match in EMAIL.finditer(data):
+              for match in EMAIL.finditer(data) if emails else ():
                   if not EMAIL_OK.search(match.group(1)):
                       found.add("email")
                       break
@@ -1314,8 +1576,43 @@ jobs:
               say(emit("SHARD", {"shard": shard, "run": run, "status": report.get("status"), "seconds": seconds,
                                  "tasks": summary["tasks"], "ok": summary["ok"], "falseSuccess": summary["falseSuccess"],
                                  "falseFailure": summary["falseFailure"], "pages": len(pages), "expected": len(expected),
-                                 "selection": "same" if match else "different"}))
+                                 "selection": "same" if match else "different",
+                                 **({"promptTokens": summary["llm"]["promptTokens"], "outputTokens": summary["llm"]["outputTokens"]}
+                                    if isinstance(summary.get("llm"), dict) else {})}))
               return report.get("status") == "passed" and match, report
+
+
+          def choose_model(base: str, key: str) -> tuple:
+              import urllib.request
+              request = urllib.request.Request(base.rstrip("/") + "/models", headers={"Authorization": f"Bearer {key}"})
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  ids = sorted(str(item.get("id")) for item in json.loads(response.read()).get("data", []))
+              for wanted in LLM_PREFERRED:
+                  if wanted in ids:
+                      return wanted, ids
+              for wanted in LLM_PREFERRED:
+                  close = [item for item in ids if item.startswith(wanted)]
+                  if close:
+                      return close[0], ids
+              return None, ids
+
+
+          def llm_env(settings: dict) -> dict | None:
+              key = os.environ.get("HXR_LLM_KEY", "").strip()
+              if not key:
+                  say(emit("MODEL", {"error": "no key"}))
+                  return None
+              try:
+                  model, ids = choose_model(LLM_BASE, key)
+              except (OSError, ValueError) as error:
+                  say(emit("MODEL", {"error": type(error).__name__}))
+                  return None
+              if model is None:
+                  say(emit("MODEL", {"error": "no preferred model", "kimi": [item for item in ids if item.startswith("kimi")]}))
+                  return None
+              say(emit("MODEL", {"model": model}))
+              return {"HX_LLM_API": "openai", "HX_LLM_BASE": LLM_BASE, "HX_LLM_KEY": key, "HX_LLM_MODEL": model,
+                      "HX_LLM_BUDGET": str(settings["llmBudget"]), "HX_LLM_MAX_TURNS": str(settings["llmMaxTurns"] or 30)}
 
 
           def run_shards(root: str, out: str, shards: list, settings: dict) -> bool:
@@ -1339,6 +1636,11 @@ jobs:
                                           text=True).stdout.strip()
               passes = int(settings.get("passes", 1))
               guard = max(10, int(settings.get("budget", 50)) // passes)
+              model_env: dict = {}
+              if settings.get("policy") == "llm":
+                  model_env = llm_env(settings) or {}
+                  if not model_env:
+                      return False
 
               def one(shard: int) -> bool:
                   folder = out_path / str(shard)
@@ -1364,8 +1666,10 @@ jobs:
                       if not expected:
                           target.write_text(json.dumps(empty_report(str(uuid.uuid4()), source_sha)), encoding="utf-8")
                       else:
-                          env = dict(os.environ, HX_RANGE_GUARD_MINUTES=str(guard), LANG="C.UTF-8", LC_ALL="C.UTF-8")
+                          env = dict(os.environ, HX_RANGE_GUARD_MINUTES=str(guard), LANG="C.UTF-8", LC_ALL="C.UTF-8",
+                                     **model_env)
                           env.pop("HX_RANGE_VISION", None)
+                          env.pop("HXR_LLM_KEY", None)
                           command = ["xvfb-run", "-a", "-n", str(100 + shard * 7), "bun", "scripts/hx-range-e2e.ts", *args,
                                      f"--label={label}"]
                           with open(folder / f"range-r{run}.log", "wb") as log:
@@ -1507,7 +1811,8 @@ jobs:
                       "repeat": int(values.get("repeat", 1)), "faults": str(values.get("faults", "")),
                       "policy": str(values.get("policy", "v176")), "old": str(values.get("old", "")),
                       "shards": int(values.get("shards", 1)), "passes": int(values.get("passes", 1)),
-                      "label": str(values.get("label", "")), "prefix": prefix, "budget": budget}
+                      "label": str(values.get("label", "")), "prefix": prefix, "budget": budget,
+                      "llmBudget": int(values.get("llmBudget") or 0), "llmMaxTurns": int(values.get("llmMaxTurns") or 0)}
 
 
           def read_request(path: str) -> dict:
@@ -1515,7 +1820,15 @@ jobs:
               values = {key: request.get(key, default) for key, default in (
                   ("only", ""), ("repeat", 1), ("faults", ""), ("policy", "v176"), ("old", ""), ("shards", 16),
                   ("passes", 1), ("label", ""), ("nonce", ""))}
-              bad = check_inputs(values)
+              llm = values["policy"] == "llm"
+              bad = check_inputs({**values, "policy": "v176"} if llm else values)
+              if llm:
+                  budget, turns = request.get("llmBudget"), request.get("llmMaxTurns", 30)
+                  if not isinstance(budget, int) or isinstance(budget, bool) or not 1 <= budget <= 5_000_000:
+                      bad.append("llmBudget")
+                  if not isinstance(turns, int) or isinstance(turns, bool) or not 1 <= turns <= 60:
+                      bad.append("llmMaxTurns")
+                  values["llmBudget"], values["llmMaxTurns"] = budget, turns
               pages = request.get("pages") or []
               if not isinstance(pages, list) or len(pages) > 5000 or any(
                       not isinstance(item, str) or not re.fullmatch(r"[A-Za-z0-9/_.-]{1,200}", item) or ".." in item
@@ -1542,6 +1855,112 @@ jobs:
               git("checkout", "-q", "--detach", base)
 
 
+          JOB_NAME = r"[A-Za-z0-9._-]{1,60}"
+
+
+          def read_jobs(path: str) -> dict:
+              spec = json.loads(Path(path).read_text(encoding="utf-8"))
+              bad = []
+              if not re.fullmatch(LABEL_RULE, str(spec.get("label", ""))):
+                  bad.append("label")
+              jobs = spec.get("jobs")
+              if not isinstance(jobs, list) or not 1 <= len(jobs) <= 64:
+                  bad.append("jobs")
+                  jobs = []
+              names = set()
+              for job in jobs:
+                  name, cmd = (job.get("name"), job.get("cmd")) if isinstance(job, dict) else (None, None)
+                  if not isinstance(name, str) or not re.fullmatch(JOB_NAME, name) or name in names:
+                      bad.append("job name")
+                  if not isinstance(cmd, str) or not cmd.strip() or len(cmd) > 4000 or "\n" in cmd:
+                      bad.append("job cmd")
+                  names.add(name)
+              parallel = spec.get("parallel", 8)
+              if not isinstance(parallel, int) or isinstance(parallel, bool) or not 1 <= parallel <= 32:
+                  bad.append("parallel")
+              llm = spec.get("llm")
+              if llm is not None:
+                  budget, turns = (llm.get("budget"), llm.get("maxTurns", 30)) if isinstance(llm, dict) else (None, None)
+                  if not isinstance(budget, int) or isinstance(budget, bool) or not 1 <= budget <= 5_000_000:
+                      bad.append("llm budget")
+                  if not isinstance(turns, int) or isinstance(turns, bool) or not 1 <= turns <= 60:
+                      bad.append("llm maxTurns")
+              if bad:
+                  raise SystemExit("bad .hx-run.json fields: " + ", ".join(sorted(set(bad))))
+              return {"label": spec["label"], "jobs": jobs, "parallel": parallel, "build": bool(spec.get("build")),
+                      "llm": llm, "base": str(spec.get("base", ""))}
+
+
+          def report_of(cmd: str) -> str:
+              mode = re.search(r"--mode=([A-Za-z0-9_-]+)", cmd)
+              label = re.search(r"--label=([A-Za-z0-9_.-]+)", cmd)
+              name = f"hx-range-{mode.group(1) if mode else 'health'}" + (f"-{label.group(1)}" if label else "")
+              return f".hxbot-build/{name}/report.json"
+
+
+          def run_jobs(root: str, spec_path: str, logs: str) -> bool:
+              spec = read_jobs(spec_path)
+              root_path, logs_path = Path(root), Path(logs)
+              logs_path.mkdir(parents=True, exist_ok=True)
+              model_env: dict = {}
+              if spec["llm"]:
+                  model_env = llm_env({"llmBudget": spec["llm"]["budget"], "llmMaxTurns": spec["llm"].get("maxTurns", 30)}) or {}
+                  if not model_env:
+                      return False
+              if spec["build"]:
+                  started = time.monotonic()
+                  with open(logs_path / "build.log", "wb") as log:
+                      done = subprocess.run(["bun", "run", "build"], cwd=root_path, stdout=log, stderr=subprocess.STDOUT)
+                  say(emit("BUILD", {"exit": done.returncode, "seconds": round(time.monotonic() - started)}))
+                  if done.returncode != 0:
+                      return False
+              reports: dict = {}
+
+              def one(item: tuple) -> bool:
+                  index, job = item
+                  time.sleep(min(index, 16) * 2)
+                  cmd = re.sub(r"(^|\s)xvfb-run -a(\s)", rf"\1xvfb-run -a -n {200 + index * 5}\2", job["cmd"], count=1)
+                  env = dict(os.environ, LANG="C.UTF-8", LC_ALL="C.UTF-8", **model_env)
+                  env.pop("HXR_LLM_KEY", None)
+                  relative = report_of(job["cmd"])
+                  target = root_path / relative
+                  started = time.time()
+                  with open(logs_path / f"{job['name']}.log", "wb") as log:
+                      done = subprocess.run(["bash", "-c", cmd], cwd=root_path, env=env, stdout=log, stderr=subprocess.STDOUT)
+                  seconds = round(time.time() - started)
+                  report = read_report(target) if target.exists() and target.stat().st_mtime >= started - 1 else None
+                  line = {"name": job["name"], "exit": done.returncode, "seconds": seconds, "report": relative if report else ""}
+                  if report is not None:
+                      summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
+                      line.update({"status": report.get("status"), **{key: summary.get(key) for key in
+                                   ("tasks", "ok", "falseSuccess", "falseFailure") if key in summary}})
+                      if isinstance(summary.get("llm"), dict):
+                          line.update({"model": summary["llm"].get("model"), "promptTokens": summary["llm"].get("promptTokens"),
+                                       "outputTokens": summary["llm"].get("outputTokens")})
+                      reports[relative] = target
+                  say(emit("JOB", line))
+                  if done.returncode != 0 and not model_env:
+                      tail = (logs_path / f"{job['name']}.log").read_text(encoding="utf-8", errors="replace").splitlines()[-30:]
+                      for text in tail:
+                          say(f"  {job['name']}| {text[:300]}")
+                  return done.returncode == 0
+
+              with ThreadPoolExecutor(max_workers=spec["parallel"]) as pool:
+                  outcomes = list(pool.map(one, list(enumerate(spec["jobs"]))))
+              secret = os.environ.get("HXR_SECRET", "")
+              for relative, path in sorted(reports.items()):
+                  found = scan_bytes(path.read_bytes(), [], secret, emails=False)
+                  if found:
+                      say(emit("SCAN", {"clean": False, "hits": {relative: found}}))
+                      outcomes.append(False)
+                      continue
+                  for line in b64_lines(str(path), relative):
+                      say(line)
+              say(emit("DONE", {"jobs": len(spec["jobs"]), "passed": sum(1 for item in outcomes[:len(spec["jobs"])] if item),
+                                "reports": len(reports), "ok": all(outcomes)}))
+              return all(outcomes)
+
+
           def runner_main(argv: list) -> int:
               command, args = (argv[0], argv[1:]) if argv else ("", [])
               if command == "fonts":
@@ -1562,6 +1981,13 @@ jobs:
                   settings = settings_from(values, args[1] if len(args) > 1 else "gh", int(args[2]) if len(args) > 2 else 50)
                   Path(args[0]).write_text(json.dumps(settings), encoding="utf-8")
                   return 0
+              if command == "jobs-check":
+                  spec = read_jobs(args[0])
+                  say(emit("JOBS", {"label": spec["label"], "jobs": len(spec["jobs"]), "parallel": spec["parallel"],
+                                    "build": spec["build"], "llm": bool(spec["llm"]), "base": spec["base"]}))
+                  return 0
+              if command == "jobs":
+                  return 0 if run_jobs(args[0], args[1], args[2]) else 1
               if command == "request":
                   values = read_request(args[0])
                   check_request_commit(args[1], values["base"])
@@ -1574,11 +2000,12 @@ jobs:
                   return 0 if run_shards(args[0], args[1], shards, settings) else 1
               if command == "scan":
                   secret = os.environ.get("HXR_SECRET", "")
+                  private = bool(args) and args[0] == "--private"
                   hits = {}
-                  for name in args:
+                  for name in args[1:] if private else args:
                       path = Path(name)
                       if path.is_file():
-                          found = scan_bytes(path.read_bytes(), SCAN_RULES, secret)
+                          found = scan_bytes(path.read_bytes(), [] if private else SCAN_RULES, secret, emails=not private)
                           if found:
                               hits[path.name] = found
                   say(emit("SCAN", {"clean": not hits, "hits": hits}))
